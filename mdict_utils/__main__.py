@@ -35,8 +35,9 @@ def run():
 
     group = parser.add_argument_group('Reader')
     group.add_argument('-x', dest='extract', action='store_true', help='extract mdx/mdd file.')
-    group.add_argument('-d', dest='exdir', help='extracted directory')
-    group.add_argument('--mdict-db', action='store_true', help='extract mdict to DB')
+    group.add_argument('-d', dest='exdir', metavar='<exdir>', help='extract mdx/mdd to directory')
+    group.add_argument('--exdb', action='store_true', help='extract mdx/mdd to DB')
+    group.add_argument('--exdb-zip', action='store_true', help='extract mdx/mdd to DB with ZIP compress')
     group.add_argument('--split-n', metavar='<number>', help='split MDX TXT to N files')
     group.add_argument('--split-az', action='store_true', help='split MDX TXT to files by a...z')
 
@@ -45,6 +46,8 @@ def run():
     group.add_argument('--title', metavar='<title>', help='Dictionary title file')
     group.add_argument('--description', metavar='<description>', help='Dictionary descritpion file')
     group.add_argument('--encoding', metavar='<encoding>', default='utf-8', help='mdx txt file encoding')
+    group.add_argument('--key-size', metavar='<size>', type=int, default=32, help='Key block size. unit: KB')
+    group.add_argument('--record-size', metavar='<size>', type=int, default=64, help='Record block size. unit: KB')
 
     args = parser.parse_args()
 
@@ -53,13 +56,8 @@ def run():
     if args.meta:
         with ElapsedTimer(verbose=True):
             meta = reader.meta(args.mdict)
-            'title' in meta and print('Title: %(title)s' % meta)
-            'generatedbyengineversion' in meta and print('Engine Version: %(generatedbyengineversion)s' % meta)
-            'record' in meta and print('Record: %(record)s' % meta)
-            'format' in meta and print('Format: %(format)s' % meta)
-            'encoding' in meta and print('Encoding: %(encoding)s' % meta)
-            'creationdate' in meta and print('Creation Date: %(creationdate)s' % meta)
-            'description' in meta and print('Description: %(description)s' % meta)
+            for k, v in meta.items():
+                print('%s: "%s"' % (k.title(), v))
     elif args.key:
         keys = reader.get_keys(args.mdict)
         count = 0
@@ -84,8 +82,8 @@ def run():
             print(record)
     elif args.extract:
         with ElapsedTimer(verbose=True):
-            if args.mdict_db:
-                reader.unpack_to_db(args.mdict)
+            if args.exdb or args.exdb_zip:
+                reader.unpack_to_db(args.exdir, args.mdict, zip=args.exdb_zip)
             else:
                 if args.split_az:
                     split = 'az'
@@ -117,11 +115,13 @@ def run():
             title = ''
             description = ''
             if args.title:
-                title = open(args.title, 'rt').read()
+                title = open(args.title, 'rt').read().strip()
             if args.description:
-                description = open(args.description, 'rt').read()
+                description = open(args.description, 'rt').read().strip()
             print('Pack to "%s"' % args.mdict)
-            pack(args.mdict, dictionary, title, description, encoding=args.encoding, is_mdd=is_mdd)
+            pack(args.mdict, dictionary, title, description,
+                 key_size=args.key_size * 1024, record_size=args.record_size * 1024,
+                 encoding=args.encoding, is_mdd=is_mdd)
     else:
         parser.print_help()
 

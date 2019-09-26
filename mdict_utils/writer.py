@@ -1,8 +1,14 @@
 
+import re
+import string
 import sqlite3
 import struct
 import os.path
+import functools
 import locale
+import zlib
+import datetime
+from cgi import escape
 
 from tqdm import tqdm
 
@@ -20,10 +26,12 @@ def get_record_null(mdict_file, key, pos, size, encoding, is_mdd):
         if mdict_file.endswith('.db'):
             conn = sqlite3.connect(mdict_file)
             MDICT_OBJ[mdict_file] = conn
+        elif is_mdd:
+            pass
         else:
             f = open(mdict_file, 'rb')
             MDICT_OBJ[mdict_file] = f
-    obj = MDICT_OBJ[mdict_file]
+    obj = MDICT_OBJ.get(mdict_file)
     if is_mdd:
         if mdict_file.endswith('.db'):
             sql = 'SELECT file FROM mdd WHERE entry=?'
@@ -32,7 +40,9 @@ def get_record_null(mdict_file, key, pos, size, encoding, is_mdd):
             record_null = row[0]
             return record_null
         else:
-            return open(mdict_file, 'rb').read()
+            assert(obj is None), 'MDD file error: %s' % mdict_file
+            with open(mdict_file, 'rb') as f:
+                return f.read()
     else:
         if mdict_file.endswith('.db'):
             sql = 'SELECT paraphrase FROM mdx WHERE entry=?'
@@ -89,9 +99,61 @@ class _MdxRecordBlock(_MdxRecordBlockBase):
 
 
 class MDictWriter(MDictWriterBase):
-    def _build_offset_table(self, d):
+    def __init__(self, d, title, description,
+                 key_size=32768, record_size=65536,
+                 encrypt_index=False,
+                 encoding="utf8",
+                 compression_type=2,
+                 version="2.0",
+                 encrypt_key=None,
+                 register_by=None,
+                 user_email=None,
+                 user_device_id=None,
+                 is_mdd=False):
+        self._key_block_size = key_size
+        self._record_block_size = record_size
+        # disable encrypt
+        super(MDictWriter, self).__init__(
+            d, title, description,
+            block_size=record_size, encrypt_index=False,
+            encoding=encoding, compression_type=compression_type, version=version,
+            encrypt_key=None, register_by=None,
+            user_email=None, user_device_id=None, is_mdd=is_mdd
+        )
+
+    def _build_offset_table(self, items):
         """One key own multi entry, so d is list"""
-        items = sorted(d, key=lambda x: locale.strxfrm(x['key']))
+        def mdict_cmp(item1, item2):
+            # sort following mdict standard
+            key1 = item1['key'].lower()
+            key2 = item2['key'].lower()
+            if not self._is_mdd:
+                key1 = regex_strip.sub('', key1)
+                key2 = regex_strip.sub('', key2)
+            # locale key
+            key1 = locale.strxfrm(key1)
+            key2 = locale.strxfrm(key2)
+            if key1 > key2:
+                return 1
+            elif key1 < key2:
+                return -1
+            # reverse
+            if len(key1) > len(key2):
+                return -1
+            elif len(key1) < len(key2):
+                return 1
+            key1 = key1.rstrip(string.punctuation)
+            key2 = key2.rstrip(string.punctuation)
+            if key1 > key2:
+                return -1
+            elif key1 < key2:
+                return 1
+            return 0
+
+        pattern = '[%s ]+' % string.punctuation
+        regex_strip = re.compile(pattern)
+
+        items.sort(key=functools.cmp_to_key(mdict_cmp))
 
         self._offset_table = []
         offset = 0
@@ -115,6 +177,12 @@ class MDictWriter(MDictWriterBase):
             ))
             offset += record['size']
         self._total_record_len = offset
+
+    def _build_key_blocks(self):
+        # Sets self._key_blocks to a list of _MdxKeyBlocks.
+        self._block_size = self._key_block_size
+        super(MDictWriter, self)._build_key_blocks()
+        self._block_size = self._record_block_size
 
     def _build_record_blocks(self):
         self._record_blocks = self._split_blocks(_MdxRecordBlock)
@@ -162,12 +230,87 @@ class MDictWriter(MDictWriterBase):
         self._write_key_sect(outfile)
         self._write_record_sect(outfile, callback=callback)
 
+    def _write_header(self, f):
+        # disable encrypt
+        encrypted = "No"
+        register_by_str = ""
+        # regcode = ""
 
-def pack(target, dictionary, title='', description='', encoding='utf-8', is_mdd=False):
+        if not self._is_mdd:
+            header_string = (
+                """<Dictionary """
+                """GeneratedByEngineVersion="{version}" """
+                """RequiredEngineVersion="{version}" """
+                """Encrypted="{encrypted}" """
+                """Encoding="{encoding}" """
+                """Format="Html" """
+                """Stripkey="Yes" """
+                """CreationDate="{date.year}-{date.month}-{date.day}" """
+                """Compact="Yes" """
+                """Compat="Yes" """
+                """KeyCaseSensitive="No" """
+                """Description="{description}" """
+                """Title="{title}" """
+                """DataSourceFormat="106" """
+                """StyleSheet="" """
+                """Left2Right="Yes" """
+                """RegisterBy="{register_by_str}" """
+                # """RegCode="{regcode}" """
+                """/>\r\n\x00"""
+            ).format(
+                version=self._version,
+                encrypted=encrypted,
+                encoding=self._encoding,
+                date=datetime.date.today(),
+                description=escape(self._description, quote=True),
+                title=escape(self._title, quote=True),
+                register_by_str=register_by_str,
+                # regcode=regcode,
+            ).encode("utf_16_le")
+        else:
+            header_string = (
+                """<Library_Data """
+                """GeneratedByEngineVersion="{version}" """
+                """RequiredEngineVersion="{version}" """
+                """Encrypted="{encrypted}" """
+                """Encoding="" """
+                """Format="" """
+                """CreationDate="{date.year}-{date.month}-{date.day}" """
+                # """Compact="No" """
+                # """Compat="No" """
+                """KeyCaseSensitive="No" """
+                """Stripkey="No" """
+                """Description="{description}" """
+                """Title="{title}" """
+                # """DataSourceFormat="106" """
+                # """StyleSheet="" """
+                """RegisterBy="{register_by_str}" """
+                # """RegCode="{regcode}" """
+                """/>\r\n\x00"""
+            ).format(
+                version=self._version,
+                encrypted=encrypted,
+                date=datetime.date.today(),
+                description=escape(self._description, quote=True),
+                title=escape(self._title, quote=True),
+                register_by_str=register_by_str,
+                # regcode=regcode
+            ).encode("utf_16_le")
+        f.write(struct.pack(b">L", len(header_string)))
+        f.write(header_string)
+        f.write(struct.pack(b"<L", zlib.adler32(header_string) & 0xffffffff))
+
+
+def pack(target, dictionary, title='', description='',
+         key_size=32768, record_size=65536, encoding='UTF-8', is_mdd=False):
     def callback(value):
         bar.update(value)
 
-    writer = MDictWriter(dictionary, title=title, description=description, encoding=encoding, is_mdd=is_mdd)
+    writer = MDictWriter(
+        dictionary, title=title, description=description,
+        key_size=key_size, record_size=record_size,
+        encoding=encoding, is_mdd=is_mdd,
+    )
     bar = tqdm(total=len(writer._offset_table), unit='rec')
     outfile = open(target, "wb")
     writer.write(outfile, callback=callback)
@@ -175,12 +318,15 @@ def pack(target, dictionary, title='', description='', encoding='utf-8', is_mdd=
     bar.close()
 
 
-def txt2db(source, callback=None):
+def txt2db(source, encoding='UTF-8', zip=False, callback=None):
     db_name = source + '.db'
     conn = sqlite3.connect(db_name)
     c = conn.cursor()
     c.execute('DROP TABLE IF EXISTS mdx')
-    c.execute('CREATE TABLE mdx (entry text not null, paraphrase text not null)')
+    if zip:
+        c.execute('CREATE TABLE mdx (entry TEXT NOT NULL, paraphrase GLOB NOT NULL)')
+    else:
+        c.execute('CREATE TABLE mdx (entry TEXT NOT NULL, paraphrase TEXT NOT NULL)')
     max_batch = 1024 * 10
     sources = []
     if os.path.isfile(source):
@@ -188,7 +334,7 @@ def txt2db(source, callback=None):
     else:
         sources.extend([os.path.join(source, f) for f in os.listdir(source) if f.endswith('.txt')])
     for source in sources:
-        with open(source, 'rt') as f:
+        with open(source, 'rt', encoding=encoding) as f:
             count = 0
             entries = []
             key = None
@@ -203,6 +349,8 @@ def txt2db(source, callback=None):
                     if not key or not content:
                         raise ValueError('Error at line %s' % count)
                     content = ''.join(content)
+                    if zip:
+                        content = zlib.compress(content.decode(encoding))
                     entries.append((key, content))
                     if count > max_batch:
                         c.executemany('INSERT INTO mdx VALUES (?,?)', entries)
@@ -224,20 +372,24 @@ def txt2db(source, callback=None):
         conn.close()
 
 
-def db2txt(source, callback=None):
+def db2txt(source, encoding='UTF-8', zip=False, callback=None):
     mdx_txt = source + '.txt'
-    with open(mdx_txt, 'wt') as f:
+    with open(mdx_txt, 'wt', encoding=encoding) as f:
         sql = 'SELECT entry, paraphrase FROM mdx'
         with sqlite3.connect(source) as conn:
             cur = conn.execute(sql)
             for c in cur:
                 f.write(c[0] + '\r\n')
-                f.write(c[1] + '\r\n')
+                if zip:
+                    value = zlib.decompress(c[1]).decode(encoding)
+                else:
+                    value = c[1]
+                f.write(value + '\r\n')
                 f.write('</>\r\n')
                 callback and callback(1)
 
 
-def pack_mdx_db(source, encoding='utf-8', callback=None):
+def pack_mdx_db(source, encoding='UTF-8', callback=None):
     dictionary = []
     sql = 'SELECT entry, paraphrase FROM mdx'
     with sqlite3.connect(source) as conn:
@@ -269,7 +421,7 @@ def pack_mdd_db(source, callback=None):
     return dictionary
 
 
-def pack_mdx_txt(source, encoding='utf-8', callback=None):
+def pack_mdx_txt(source, encoding='UTF-8', callback=None):
     dictionary = []
     sources = []
     null_length = len('\0'.encode(encoding))
@@ -310,6 +462,39 @@ def pack_mdx_txt(source, encoding='utf-8', callback=None):
                 else:
                     offset = f.tell()
 
+                line = f.readline()
+    return dictionary
+
+
+def pack_mdx_txt2(source, encoding='UTF-8'):
+    dictionary = {}
+    sources = []
+    if os.path.isfile(source):
+        sources.append(source)
+    else:
+        sources.extend([os.path.join(source, f) for f in os.listdir(source) if f.endswith('.txt')])
+    for source in sources:
+        with open(source, 'rt', encoding=encoding) as f:
+            key = None
+            count = 0
+            content = ''
+            line = f.readline()
+            while line:
+                count += 1
+                line = line.strip()
+                if not line:
+                    line = f.readline()
+                    continue
+                if line == '</>':
+                    if not key:
+                        raise ValueError('Error at line %s: %s' % (count, key))
+                    dictionary[key] = content
+                    key = None
+                    content = ''
+                elif not key:
+                    key = line
+                else:
+                    content += line
                 line = f.readline()
     return dictionary
 
